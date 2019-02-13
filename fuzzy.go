@@ -6,9 +6,14 @@ VSCode, IntelliJ IDEA et al.
 package fuzzy
 
 import (
+	"context"
+	"runtime"
 	"sort"
+	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // Match represents a matched string.
@@ -87,98 +92,120 @@ func FindFrom(pattern string, data Source) Matches {
 	if len(pattern) == 0 {
 		return nil
 	}
+	ctx := context.TODO()
+
+	var (
+		maxWorkers = runtime.GOMAXPROCS(0)
+		sem        = semaphore.NewWeighted(int64(maxWorkers))
+	)
+
+	var mx sync.Mutex
 	runes := []rune(pattern)
 	var matches Matches
 	var matchedIndexes []int
 	for i := 0; i < data.Len(); i++ {
-		var match Match
-		match.Str = data.String(i)
-		match.Index = i
-		if matchedIndexes != nil {
-			match.MatchedIndexes = matchedIndexes
-		} else {
-			match.MatchedIndexes = make([]int, 0, len(runes))
+
+		if err := sem.Acquire(ctx, 1); err != nil {
+			break
 		}
-		var score int
-		patternIndex := 0
-		bestScore := -1
-		matchedIndex := -1
-		currAdjacentMatchBonus := 0
-		var last rune
-		var lastIndex int
-		nextc, nextSize := utf8.DecodeRuneInString(data.String(i))
-		var candidate rune
-		var candidateSize int
-		for j := 0; j < len(data.String(i)); j += candidateSize {
-			candidate, candidateSize = nextc, nextSize
-			if equalFold(candidate, runes[patternIndex]) {
-				score = 0
-				if j == 0 {
-					score += firstCharMatchBonus
-				}
-				if unicode.IsLower(last) && unicode.IsUpper(candidate) {
-					score += camelCaseMatchBonus
-				}
-				if j != 0 && isSeparator(last) {
-					score += matchFollowingSeparatorBonus
-				}
-				if len(match.MatchedIndexes) > 0 {
-					lastMatch := match.MatchedIndexes[len(match.MatchedIndexes)-1]
-					bonus := adjacentCharBonus(lastIndex, lastMatch, currAdjacentMatchBonus)
-					score += bonus
-					// adjacent matches are incremental and keep increasing based on previous adjacent matches
-					// thus we need to maintain the current match bonus
-					currAdjacentMatchBonus += bonus
-				}
-				if score > bestScore {
-					bestScore = score
-					matchedIndex = j
-				}
-			}
-			var nextp rune
-			if patternIndex < len(runes)-1 {
-				nextp = runes[patternIndex+1]
-			}
-			if j+candidateSize < len(data.String(i)) {
-				if data.String(i)[j+candidateSize] < utf8.RuneSelf { // Fast path for ASCII
-					nextc, nextSize = rune(data.String(i)[j+candidateSize]), 1
-				} else {
-					nextc, nextSize = utf8.DecodeRuneInString(data.String(i)[j+candidateSize:])
-				}
+		go func(dataStr string, i int) {
+			defer mx.Unlock()
+			defer sem.Release(1)
+			var match Match
+			match.Str = dataStr
+			match.Index = i
+			if matchedIndexes != nil {
+				match.MatchedIndexes = matchedIndexes
 			} else {
-				nextc, nextSize = 0, 0
+				match.MatchedIndexes = make([]int, 0, len(runes))
 			}
-			// We apply the best score when we have the next match coming up or when the search string has ended.
-			// Tracking when the next match is coming up allows us to exhaustively find the best match and not necessarily
-			// the first match.
-			// For example given the pattern "tk" and search string "The Black Knight", exhaustively matching allows us
-			// to match the second k thus giving this string a higher score.
-			if equalFold(nextp, nextc) || nextc == 0 {
-				if matchedIndex > -1 {
-					if len(match.MatchedIndexes) == 0 {
-						penalty := matchedIndex * unmatchedLeadingCharPenalty
-						bestScore += max(penalty, maxUnmatchedLeadingCharPenalty)
-					}
-					match.Score += bestScore
-					match.MatchedIndexes = append(match.MatchedIndexes, matchedIndex)
+			var score int
+			patternIndex := 0
+			bestScore := -1
+			matchedIndex := -1
+			currAdjacentMatchBonus := 0
+			var last rune
+			var lastIndex int
+			nextc, nextSize := utf8.DecodeRuneInString(dataStr)
+			var candidate rune
+			var candidateSize int
+			for j := 0; j < len(dataStr); j += candidateSize {
+				candidate, candidateSize = nextc, nextSize
+				if equalFold(candidate, runes[patternIndex]) {
 					score = 0
-					bestScore = -1
-					patternIndex++
+					if j == 0 {
+						score += firstCharMatchBonus
+					}
+					if unicode.IsLower(last) && unicode.IsUpper(candidate) {
+						score += camelCaseMatchBonus
+					}
+					if j != 0 && isSeparator(last) {
+						score += matchFollowingSeparatorBonus
+					}
+					if len(match.MatchedIndexes) > 0 {
+						lastMatch := match.MatchedIndexes[len(match.MatchedIndexes)-1]
+						bonus := adjacentCharBonus(lastIndex, lastMatch, currAdjacentMatchBonus)
+						score += bonus
+						// adjacent matches are incremental and keep increasing based on previous adjacent matches
+						// thus we need to maintain the current match bonus
+						currAdjacentMatchBonus += bonus
+					}
+					if score > bestScore {
+						bestScore = score
+						matchedIndex = j
+					}
 				}
+				var nextp rune
+				if patternIndex < len(runes)-1 {
+					nextp = runes[patternIndex+1]
+				}
+				if j+candidateSize < len(dataStr) {
+					if dataStr[j+candidateSize] < utf8.RuneSelf { // Fast path for ASCII
+						nextc, nextSize = rune(dataStr[j+candidateSize]), 1
+					} else {
+						nextc, nextSize = utf8.DecodeRuneInString(dataStr[j+candidateSize:])
+					}
+				} else {
+					nextc, nextSize = 0, 0
+				}
+				// We apply the best score when we have the next match coming up or when the search string has ended.
+				// Tracking when the next match is coming up allows us to exhaustively find the best match and not necessarily
+				// the first match.
+				// For example given the pattern "tk" and search string "The Black Knight", exhaustively matching allows us
+				// to match the second k thus giving this string a higher score.
+				if equalFold(nextp, nextc) || nextc == 0 {
+					if matchedIndex > -1 {
+						if len(match.MatchedIndexes) == 0 {
+							penalty := matchedIndex * unmatchedLeadingCharPenalty
+							bestScore += max(penalty, maxUnmatchedLeadingCharPenalty)
+						}
+						match.Score += bestScore
+						match.MatchedIndexes = append(match.MatchedIndexes, matchedIndex)
+						score = 0
+						bestScore = -1
+						patternIndex++
+					}
+				}
+				lastIndex = j
+				last = candidate
 			}
-			lastIndex = j
-			last = candidate
-		}
-		// apply penalty for each unmatched character
-		penalty := len(match.MatchedIndexes) - len(data.String(i))
-		match.Score += penalty
-		if len(match.MatchedIndexes) == len(runes) {
-			matches = append(matches, match)
-			matchedIndexes = nil
-		} else {
-			matchedIndexes = match.MatchedIndexes[:0] // Recycle match index slice
-		}
+			// apply penalty for each unmatched character
+			penalty := len(match.MatchedIndexes) - len(dataStr)
+			match.Score += penalty
+			mx.Lock()
+			if len(match.MatchedIndexes) == len(runes) {
+				matches = append(matches, match)
+				matchedIndexes = nil
+			} else {
+				matchedIndexes = match.MatchedIndexes[:0] // Recycle match index slice
+			}
+		}(data.String(i), i)
 	}
+	// Acquire all of the tokens to wait for any remaining workers to finish.
+	if err := sem.Acquire(ctx, int64(maxWorkers)); err != nil {
+		return nil
+	}
+	sem = nil
 	sort.Stable(matches)
 	return matches
 }
