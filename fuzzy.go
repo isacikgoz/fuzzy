@@ -6,7 +6,6 @@ VSCode, IntelliJ IDEA et al.
 package fuzzy
 
 import (
-	"fmt"
 	"sort"
 	"unicode"
 	"unicode/utf8"
@@ -16,8 +15,6 @@ import (
 type Match struct {
 	// The matched string.
 	Str string
-	// Actual value
-	Val *interface{}
 	// The index of the matched string in the supplied slice.
 	Index int
 	// The indexes of matched characters. Useful for highlighting matches.
@@ -52,8 +49,6 @@ type Source interface {
 	String(i int) string
 	// The length of the source. Typically is the length of the slice of things that you want to match.
 	Len() int
-	// Return the actual value
-	Value(i int) *interface{}
 }
 
 type stringSource []string
@@ -61,16 +56,6 @@ type stringSource []string
 func (ss stringSource) String(i int) string { return ss[i] }
 
 func (ss stringSource) Len() int { return len(ss) }
-
-func (ss stringSource) Value(i int) *interface{} { return nil }
-
-type interfaceSource []*interface{}
-
-func (is interfaceSource) String(i int) string { return fmt.Sprint(*is[i]) }
-
-func (is interfaceSource) Len() int { return len(is) }
-
-func (is interfaceSource) Value(i int) *interface{} { return is[i] }
 
 /*
 Find looks up pattern in data and returns matches
@@ -94,11 +79,6 @@ func Find(pattern string, data []string) Matches {
 	return FindFrom(pattern, stringSource(data))
 }
 
-// FindInterface is same as Find but takes *interface{} array, uses fmt.Sprint to get string value
-func FindInterface(pattern string, data []*interface{}) Matches {
-	return FindFrom(pattern, interfaceSource(data))
-}
-
 /*
 FindFrom is an alternative implementation of Find using a Source
 instead of a list of strings.
@@ -113,7 +93,6 @@ func FindFrom(pattern string, data Source) Matches {
 	for i := 0; i < data.Len(); i++ {
 		var match Match
 		match.Str = data.String(i)
-		match.Val = data.Value(i)
 		match.Index = i
 		if matchedIndexes != nil {
 			match.MatchedIndexes = matchedIndexes
